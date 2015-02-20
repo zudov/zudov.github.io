@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <title>Generating modules with data</title>
+        <link rel="stylesheet" type="text/css" href="../css/hscolour.css" />
+        <link rel="stylesheet" type="text/css" href="../css/default.css" />
+    </head>
+    <body>
+        <div id="content">
+            <div id="logo">
+                <a href="../">ZUDOV</a>
+            </div>
+
+            <h1>Generating modules with data</h1>
+
+            <div class="info">
+    Posted on February 18, 2015
+    
+
+</div>
+
+<p><strong>TLDR</strong>: <em>I describe the problem which involves looking up HTML5 entities from a big JSON file, and provide a neat solution which involves non Template Haskell metaprogramming and code generation.</em></p>
+<h1 id="example-of-a-problem">Example of a problem</h1>
+<p>While working on <a href="http://commonmark.org">CommonMark</a> parser, I needed to implement parsing of named <a href="http://www.w3schools.com/html/html_entities.asp">HTML entities</a>. Excluding non-important for that example parts, CommonMark specification requires complying with following rules when parsing entities:</p>
+<ul>
+<li>Named entities consist of <code>&amp;</code> + any of the valid HTML5 entity names + <code>;</code> (e.g. <code>&amp;copy;</code>).</li>
+<li>Strings that are not on the list of HTML5 named entities are not recognized as entities.</li>
+<li>The <a href="https://html.spec.whatwg.org/multipage/entities.json">following json file</a> is used as an authoritative source of the valid entity names and their corresponding codepoints.</li>
+<li>With the goal of making this standard as HTML-agnostic as possible, all valid HTML entities are recognized as such and converted into Unicode characters.</li>
+</ul>
+<p>While this article is not about parsing at all, I believe you see the problem: parser should consult with a big (2000+ fields) JSON object and in case if the parsed string is a valid entity string should be replaced with corresponding Unicode characters.</p>
+<h1 id="naive-solution">Naive solution</h1>
+<p>If I was using Javascript, I would be able to simply load that file and access it as a normal JS-object. However, I am using Haskell and our Glorious Compiler would refuse to compile JSON file.</p>
+<p>I could simply read the file at startup, parse it into appropriate data structure and pass to my entity parser. However, I don’t like that approach for several reasons:</p>
+<ul>
+<li>need to keep the file somewhere around</li>
+<li>need to load and parse it at startup</li>
+<li>need for additional dependencies. Markdown parser doesn’t need JSON parsing library at all, why bring it there just to read a list of entities.</li>
+<li>Ugliness. I just need to access a static permanent data structure with entities and corresponding characters. How does it have to do with IO?</li>
+</ul>
+<h1 id="how-can-we-do-better">How can we do better?</h1>
+<p>The obvious solution which is free of all disadvantages listed above came to me pretty fast: I simply need to literally put the data into the Haskell module, compile it and then access it the way I want to.</p>
+<p>Such solution could be applied to some other problems. Let’s say in your web-app you want to provide the user with choice of his home-city based on the country and region that he provided. Usually this problem is tackled by querying the cities from database, but is it really necessary if the list is not to big and can be easily fit in memory?</p>
+<h1 id="how-would-we-implement-the-better">How would we implement ‘the better’?</h1>
+<p>We need to transform the JSON file into a Haskell module. Precisely, we need to parse the data from JSON object and then generate the code which would give us the pure Haskell representation of that data. The generated code can then be compiled and used in our application.</p>
+<p>I decided not to use Template Haskell here, for the reason mentioned above: <em>need for additional dependencies</em>. Also, there is no need to generate exact same code using exact same data on every single compilation, instead of generating it once and for all.</p>
+<p>As the problem of entity parsing is quite general I decided that it deserves to be solved with a small (in terms of functionality, not SLOC) library.</p>
+<h2 id="library-structure">Library structure</h2>
+<p>Nothing really special here, we would have two modules <code>Text.Html5.Entity.Data</code> – auto generated module with data, and <code>Text.Html5.Entity</code> – some convenience functions to access that data.</p>
+<p>The <code>Generate.hs</code> that generates <code>Text.Html5.Entity.Data</code> would be shipped as an executable which gets build only when enabled with flag.</p>
+<h2 id="a-look-at-the-source-data">A look at the source data</h2>
+<p>If you didn’t take a look at the JSON file a linked above, it is a big object with 2000+ entries similar to this one:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell">{ <span class="st">&quot;&amp;pound;&quot;</span><span class="fu">:</span> { <span class="st">&quot;codepoints&quot;</span><span class="fu">:</span> [<span class="dv">163</span>], <span class="st">&quot;characters&quot;</span><span class="fu">:</span> <span class="st">&quot;\u00A3&quot;</span> }</code></pre>
+<p>In Haskell we can represent it with such a tuple:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell">(<span class="st">&quot;&amp;pound;&quot;</span>, [<span class="dv">163</span>])<span class="ot"> ::</span> (<span class="dt">String</span>, [<span class="dt">Int</span>])</code></pre>
+<p>We don’t need to keep the characters as <code>Data.Char.chr</code> function will happily turn <code>Int</code> codepoint into corresponding <code>Char</code>.</p>
+<p>The generated <code>Text.Html5.Entity.Data</code> would define two functions: <code>entityMap :: Map String [Int]</code> – which as you can guess contains a mapping between entities and corresponding codepoints, and <code>entitySet :: Set String</code> – which contains a set of entities for efficient validation without lookup.</p>
+<h2 id="parsing-the-source-data">Parsing the source data</h2>
+<p>First we need to transform that big JSON object into appropriate <code>[(String, [Int])]</code>, further known as <code>Entities</code> (<code>type Entities = [(String, [Int])]</code>).</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="co">-- file: generation/Generate.hs</span>
+<span class="ot">{-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}</span>
+
+<span class="kw">import           </span><span class="dt">Control.Applicative</span> ((&lt;$&gt;))
+<span class="kw">import           </span><span class="dt">Data.Aeson</span>
+<span class="kw">import qualified</span> <span class="dt">Data.ByteString.Lazy</span> <span class="kw">as</span> <span class="dt">BS</span>
+<span class="kw">import qualified</span> <span class="dt">Data.HashMap.Lazy</span> <span class="kw">as</span> <span class="dt">HM</span>
+
+<span class="kw">newtype</span> <span class="dt">EntityVal</span> <span class="fu">=</span> <span class="dt">EntityVal</span> {<span class="ot"> codepoints ::</span> [<span class="dt">Int</span>] } <span class="kw">deriving</span> (<span class="dt">Show</span>, <span class="dt">Eq</span>)
+<span class="kw">instance</span> <span class="dt">FromJSON</span> <span class="dt">EntityVal</span> <span class="kw">where</span>
+    parseJSON (<span class="dt">Object</span> o) <span class="fu">=</span> <span class="dt">EntityVal</span> <span class="fu">&lt;$&gt;</span> o <span class="fu">.:</span> <span class="st">&quot;codepoints&quot;</span>
+    parseJSON _ <span class="fu">=</span> error <span class="st">&quot;Not an object&quot;</span>
+
+<span class="kw">type</span> <span class="dt">Entities</span> <span class="fu">=</span> [(<span class="dt">String</span>, [<span class="dt">Int</span>])]
+
+<span class="ot">main ::</span> <span class="dt">IO</span> ()
+main <span class="fu">=</span> <span class="kw">do</span>
+    entFile <span class="ot">&lt;-</span> BS.readFile <span class="st">&quot;entities.json&quot;</span>
+    <span class="kw">let</span> <span class="dt">Just</span> (<span class="ot">entities ::</span> <span class="dt">Entities</span>) <span class="fu">=</span> HM.toList <span class="fu">.</span> HM.map codepoints <span class="fu">&lt;$&gt;</span> decode entFile</code></pre>
+<p>If you are familiar with <a href="https://hackage.haskell.org/package/aeson">Aeson</a> all should be clear for you. If it’s not don’t worry, all that you need to know is that now we have all the Entities binded to the name <code>entities</code> and we can proceed to code-generation.</p>
+<h2 id="writing-a-code-that-will-write-the-code">Writing a code that will write the code</h2>
+<p>For parsing, transforming and producing Haskell98 code there is quite old but suiting library <a href="https://hackage.haskell.org/package/haskell-src/"><code>haskell-src</code></a>. For something more serious than what I’m doing you really should use <a href="https://hackage.haskell.org/package/haskell-src/"><code>haskell-src-exts</code></a> as <code>haskell-src</code> was abandoned for about 10 years from now.</p>
+<p>It allows parsing the code into AST(Abstract Syntax Tree), do simple manipulations with it and pretty-print the AST. I wouldn’t go into details of working with AST as it should be pretty clear from <a href="https://hackage.haskell.org/package/haskell-src-1.0.2.0/docs/Language-Haskell-Syntax.html">documentation</a>. AST is just a few ADTs (Abstract Data Types) which you can operate as you normally operate the ADTs. So, just take a look at the definition of the AST and you will get it.</p>
+<h3 id="importing">Importing</h3>
+<p>To use <code>haskell-src</code> we would obviously need some additional imports:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="kw">import </span><span class="dt">Language.Haskell.Syntax</span> <span class="co">-- defenition of AST</span>
+<span class="kw">import </span><span class="dt">Language.Haskell.Pretty</span> <span class="co">-- module for pretty-printing AST</span>
+<span class="kw">import </span><span class="dt">Language.Haskell.Parser</span> <span class="co">-- module for parsing the code into AST</span></code></pre>
+<h4 id="wait-you-told-we-gonna-generate-why-do-we-need-parser">Wait, you told we gonna generate, why do we need Parser?</h4>
+<p>The problem is that writing code in AST form is pretty verbose. See for yourself, this simple imports:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="kw">import </span><span class="dt">Data.Map</span> (<span class="dt">Map</span>)
+<span class="kw">import qualified</span> <span class="dt">Data.Map</span> <span class="kw">as</span> <span class="dt">M</span>
+<span class="kw">import </span><span class="dt">Data.Set</span> (<span class="dt">Set</span>)
+<span class="kw">import qualified</span> <span class="dt">Data.Set</span> <span class="kw">as</span> <span class="dt">S</span></code></pre>
+<p>would look like this:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell">[ <span class="dt">HsImportDecl</span> noloc (<span class="dt">Module</span> <span class="st">&quot;Data.Map&quot;</span>) <span class="dt">True</span> (<span class="dt">Just</span> <span class="fu">$</span> <span class="dt">Module</span> <span class="st">&quot;M&quot;</span>)
+               (<span class="dt">Just</span> (<span class="dt">False</span>, [ <span class="dt">HsIVar</span> <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>
+                             , <span class="dt">HsIAbs</span> <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;Map&quot;</span>]))
+, <span class="dt">HsImportDecl</span> noloc (<span class="dt">Module</span> <span class="st">&quot;Data.Set&quot;</span>) <span class="dt">True</span> (<span class="dt">Just</span> <span class="fu">$</span> <span class="dt">Module</span> <span class="st">&quot;S&quot;</span>)
+               (<span class="dt">Just</span> (<span class="dt">False</span>, [ <span class="dt">HsIVar</span> <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>
+                             , <span class="dt">HsIAbs</span> <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;Set&quot;</span>]))]</code></pre>
+<p>That’s why I would use code-generation only for the code that I really need to generate, the rest would be defined in a file <code>Template.hs</code>. I would parse that template append generated definitions to it, and then print it into my module.</p>
+<p>Here is my <code>Template.hs</code> which contains all the import and type declarations:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="co">-- file: Template.hs</span>
+<span class="kw">module</span> <span class="dt">Text.Html5.Entity.Data</span> <span class="kw">where</span>
+
+<span class="kw">import           </span><span class="dt">Data.Map</span> (<span class="dt">Map</span>)
+<span class="kw">import qualified</span> <span class="dt">Data.Map</span> <span class="kw">as</span> <span class="dt">M</span>
+<span class="kw">import           </span><span class="dt">Data.Set</span> (<span class="dt">Set</span>)
+<span class="kw">import qualified</span> <span class="dt">Data.Set</span> <span class="kw">as</span> <span class="dt">S</span>
+
+<span class="ot">entityMap ::</span> <span class="dt">Map</span> <span class="dt">String</span> [<span class="dt">Int</span>]
+<span class="ot">entitySet ::</span> <span class="dt">Set</span> <span class="dt">String</span></code></pre>
+<p>A bit later a would show how can we parse and complete it, but first we need to additional declarations which would define <code>entityMap</code> and <code>entitySet</code>.</p>
+<h3 id="defining-the-set">Defining the Set</h3>
+<p>Let’s think how would the <code>entitySet</code> expression look if we were writing it literally:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell">S.fromList [] <span class="co">-- This empty list should actually have 2000+ entities</span></code></pre>
+<p>We apply a qualified imported function <code>fromList</code> to an empty list. Here is the same thing in AST form:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="dt">HsApp</span> (<span class="dt">HsVar</span> <span class="fu">$</span> <span class="dt">Qual</span> (<span class="dt">Module</span> <span class="st">&quot;S&quot;</span>) <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>) (<span class="dt">HsList</span> [])</code></pre>
+<p>Should be pretty clear, huh? Application, variable identifier and a list. Everything is in place.</p>
+<p>This would give as an empty <code>Set</code>, but in fact we need the <code>Set</code> with all our data. Let’s complete expression above into a function which takes our <code>Entities</code> and returns an AST expression with the <code>Set</code> of those entities:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="ot">mkEntitySet ::</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> <span class="dt">HsExp</span>
+mkEntitySet entities <span class="fu">=</span> <span class="dt">HsApp</span> (<span class="dt">HsVar</span> <span class="fu">$</span> <span class="dt">Qual</span> (<span class="dt">Module</span> <span class="st">&quot;S&quot;</span>) <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>)
+                             (<span class="dt">HsList</span> <span class="fu">$</span> map (<span class="dt">HsLit</span> <span class="fu">.</span> <span class="dt">HsString</span> <span class="fu">.</span> fst) entities)</code></pre>
+<p>Nothing new, except that instead of the empty list we have <code>map (HsLit . HsString . fst) ents</code>, which turns a list of entities into a list of string literals.</p>
+<p>As we are done with defining expression for <code>entitySet</code> we can move to the expression for <code>entityMap</code>.</p>
+<h3 id="defining-the-map">Defining the Map</h3>
+<p>Function <code>mkEntityMap</code> is very similar to <code>mkEntitySet</code> but a bit more complex as instead of string literals we need to build tuples `(String, [Int]).</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="ot">mkEntityMap ::</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> <span class="dt">HsExp</span>
+mkEntityMap ents <span class="fu">=</span> <span class="dt">HsApp</span> (<span class="dt">HsVar</span> <span class="fu">$</span> <span class="dt">Qual</span> (<span class="dt">Module</span> <span class="st">&quot;M&quot;</span>) <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>)
+                         (<span class="dt">HsList</span> <span class="fu">$</span> map mkMapElemTup ents)
+
+<span class="ot">mkMapElemTup ::</span> (<span class="dt">String</span>, [<span class="dt">Int</span>]) <span class="ot">-&gt;</span> <span class="dt">HsExp</span>
+mkMapElemTup (name, codes) <span class="fu">=</span>
+    <span class="dt">HsTuple</span> [ <span class="dt">HsLit</span> <span class="fu">$</span> <span class="dt">HsString</span> name
+            , <span class="dt">HsList</span> <span class="fu">$</span> map (<span class="dt">HsLit</span> <span class="fu">.</span> <span class="dt">HsInt</span>) codes
+            ] </code></pre>
+<p>I hope you will figure out how this works by yourself.</p>
+<h3 id="bindem">Bind’em</h3>
+<p>Now when we have expressions for <code>entitySet</code> and <code>entityMap</code> the only thing that’s left is to bind them to corresponding names:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="ot">decls ::</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> [<span class="dt">HsDecl</span>]
+decls ents <span class="fu">=</span>
+    [ <span class="dt">HsFunBind</span> [<span class="dt">HsMatch</span> noloc (<span class="dt">HsIdent</span> <span class="st">&quot;entityMap&quot;</span>) []
+                               (<span class="dt">HsUnGuardedRhs</span> (mkEntityMap ents)) []]
+    , <span class="dt">HsFunBind</span> [<span class="dt">HsMatch</span> noloc (<span class="dt">HsIdent</span> <span class="st">&quot;entitySet&quot;</span>) []
+                               (<span class="dt">HsUnGuardedRhs</span> (mkEntitySet ents)) []]
+    ]
+
+noloc <span class="fu">=</span> <span class="dt">SrcLoc</span> <span class="st">&quot;&quot;</span> <span class="dv">0</span> <span class="dv">0</span></code></pre>
+<p>Leaving alone a little verbosity it should be pretty clear. <code>SrcLoc</code> points to the location of the defenition in file, but when we generating the code it doesn’t matter.</p>
+<h3 id="assembling-it-together">Assembling it together</h3>
+<p>Seems like we are almost done with code-generating, what’s left is to parse our template, append it with our declarations and pretty-print it into our file. Let’s complete our <code>main</code> function.</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell">main <span class="fu">=</span> <span class="kw">do</span>
+    entFile <span class="ot">&lt;-</span> BS.readFile <span class="st">&quot;generation/entities.json&quot;</span>
+    <span class="kw">let</span> <span class="dt">Just</span> entMap <span class="fu">=</span> HM.toList <span class="fu">.</span> HM.map codepoints <span class="fu">&lt;$&gt;</span> decode entFile
+    <span class="dt">ParseOk</span> template <span class="ot">&lt;-</span> parseModule <span class="fu">&lt;$&gt;</span> readFile <span class="st">&quot;generation/Template.hs&quot;</span>
+    writeFile <span class="st">&quot;src/Text/Html5/Entity/Data.hs&quot;</span> <span class="fu">$</span> prettyPrint 
+                                              <span class="fu">$</span> appendTemplate template entMap
+
+<span class="ot">appendTemplate ::</span> <span class="dt">HsModule</span> <span class="ot">-&gt;</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> <span class="dt">HsModule</span>
+appendTemplate (<span class="dt">HsModule</span> srcLoc modName exports imports decls') ents <span class="fu">=</span>
+    <span class="dt">HsModule</span> srcLoc modName exports imports (decls' <span class="fu">++</span> decls ents)</code></pre>
+<p>Now we are done with module generating script, here is its full source:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="ot">{-# LANGUAGE OverloadedStrings #-}</span>
+
+<span class="kw">import           </span><span class="dt">Control.Applicative</span> ((&lt;$&gt;))
+<span class="kw">import           </span><span class="dt">Data.Aeson</span>
+<span class="kw">import qualified</span> <span class="dt">Data.ByteString.Lazy</span> <span class="kw">as</span> <span class="dt">BS</span>
+<span class="kw">import qualified</span> <span class="dt">Data.HashMap.Lazy</span> <span class="kw">as</span> <span class="dt">HM</span>
+
+<span class="kw">import </span><span class="dt">Language.Haskell.Syntax</span>
+<span class="kw">import </span><span class="dt">Language.Haskell.Pretty</span>
+<span class="kw">import </span><span class="dt">Language.Haskell.Parser</span>
+
+<span class="kw">newtype</span> <span class="dt">EntityVal</span> <span class="fu">=</span> <span class="dt">EntityVal</span> {<span class="ot"> codepoints ::</span> [<span class="dt">Int</span>] } <span class="kw">deriving</span> (<span class="dt">Show</span>, <span class="dt">Eq</span>)
+<span class="kw">instance</span> <span class="dt">FromJSON</span> <span class="dt">EntityVal</span> <span class="kw">where</span>
+    parseJSON (<span class="dt">Object</span> o) <span class="fu">=</span> <span class="dt">EntityVal</span> <span class="fu">&lt;$&gt;</span> o <span class="fu">.:</span> <span class="st">&quot;codepoints&quot;</span>
+    parseJSON _ <span class="fu">=</span> error <span class="st">&quot;Not an object&quot;</span>
+
+<span class="kw">type</span> <span class="dt">Entity</span> <span class="fu">=</span> [(<span class="dt">String</span>, [<span class="dt">Int</span>])]
+
+<span class="ot">main ::</span> <span class="dt">IO</span> ()
+main <span class="fu">=</span> <span class="kw">do</span>
+    entFile <span class="ot">&lt;-</span> BS.readFile <span class="st">&quot;generation/entities.json&quot;</span>
+    <span class="kw">let</span> <span class="dt">Just</span> entMap <span class="fu">=</span> HM.toList <span class="fu">.</span> HM.map codepoints <span class="fu">&lt;$&gt;</span> decode entFile
+    <span class="dt">ParseOk</span> template <span class="ot">&lt;-</span> parseModule <span class="fu">&lt;$&gt;</span> readFile <span class="st">&quot;generation/Template.hs&quot;</span>
+    writeFile <span class="st">&quot;src/Text/Html5/Entity/Data.hs&quot;</span> <span class="fu">$</span> prettyPrint 
+                                              <span class="fu">$</span> appendTemplate template entMap
+
+<span class="co">-- | AST generation</span>
+<span class="ot">appendTemplate ::</span> <span class="dt">HsModule</span> <span class="ot">-&gt;</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> <span class="dt">HsModule</span>
+appendTemplate (<span class="dt">HsModule</span> srcLoc modName exports imports decls') ents <span class="fu">=</span>
+    <span class="dt">HsModule</span> srcLoc modName exports imports (decls' <span class="fu">++</span> decls ents)
+
+
+<span class="ot">decls ::</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> [<span class="dt">HsDecl</span>]
+decls ents <span class="fu">=</span>
+    [ <span class="dt">HsFunBind</span> [<span class="dt">HsMatch</span> noloc (<span class="dt">HsIdent</span> <span class="st">&quot;entityMap&quot;</span>) []
+                               (<span class="dt">HsUnGuardedRhs</span> (mkEntityMap ents)) []]
+    , <span class="dt">HsFunBind</span> [<span class="dt">HsMatch</span> noloc (<span class="dt">HsIdent</span> <span class="st">&quot;entitySet&quot;</span>) []
+                               (<span class="dt">HsUnGuardedRhs</span> (mkEntitySet ents)) []]
+    ]
+
+<span class="ot">mkEntityMap ::</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> <span class="dt">HsExp</span>
+mkEntityMap ents <span class="fu">=</span> <span class="dt">HsApp</span> (<span class="dt">HsVar</span> <span class="fu">$</span> <span class="dt">Qual</span> (<span class="dt">Module</span> <span class="st">&quot;M&quot;</span>) <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>)
+                         (<span class="dt">HsList</span> <span class="fu">$</span> map mkMapElemTup ents)
+
+<span class="ot">mkMapElemTup ::</span> (<span class="dt">String</span>, [<span class="dt">Int</span>]) <span class="ot">-&gt;</span> <span class="dt">HsExp</span>
+mkMapElemTup (name, codes) <span class="fu">=</span>
+    <span class="dt">HsTuple</span> [ <span class="dt">HsLit</span> <span class="fu">$</span> <span class="dt">HsString</span> name
+            , <span class="dt">HsList</span> <span class="fu">$</span> map (<span class="dt">HsLit</span> <span class="fu">.</span> <span class="dt">HsInt</span>) codes
+            ] 
+
+<span class="ot">mkEntitySet ::</span> <span class="dt">Entities</span> <span class="ot">-&gt;</span> <span class="dt">HsExp</span>
+mkEntitySet ents <span class="fu">=</span> <span class="dt">HsApp</span> (<span class="dt">HsVar</span> <span class="fu">$</span> <span class="dt">Qual</span> (<span class="dt">Module</span> <span class="st">&quot;S&quot;</span>) <span class="fu">$</span> <span class="dt">HsIdent</span> <span class="st">&quot;fromList&quot;</span>)
+                         (<span class="dt">HsList</span> <span class="fu">$</span> map (<span class="dt">HsLit</span> <span class="fu">.</span> <span class="dt">HsString</span> <span class="fu">.</span> fst) ents)
+
+<span class="ot">noloc ::</span> <span class="dt">SrcLoc</span>
+noloc <span class="fu">=</span> <span class="dt">SrcLoc</span> <span class="st">&quot;&quot;</span> <span class="dv">0</span> <span class="dv">0</span></code></pre>
+<p>If we run it we would get the following module generated:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="kw">module</span> <span class="dt">Text.Html5.Entity.Data</span> <span class="kw">where</span>
+<span class="kw">import </span><span class="dt">Data.Map</span> (<span class="dt">Map</span>)
+<span class="kw">import qualified</span> <span class="dt">Data.Map</span> <span class="kw">as</span> <span class="dt">M</span>
+<span class="kw">import </span><span class="dt">Data.Set</span> (<span class="dt">Set</span>)
+<span class="kw">import qualified</span> <span class="dt">Data.Set</span> <span class="kw">as</span> <span class="dt">S</span>
+ 
+<span class="ot">entityMap ::</span> <span class="dt">Map</span> <span class="dt">String</span> [<span class="dt">Int</span>]
+ 
+<span class="ot">entitySet ::</span> <span class="dt">Set</span> <span class="dt">String</span>
+entityMap
+  <span class="fu">=</span> M.fromList
+      [(<span class="st">&quot;&amp;intlarhk;&quot;</span>, [<span class="dv">10775</span>]), (<span class="st">&quot;&amp;male;&quot;</span>, [<span class="dv">9794</span>]), (<span class="st">&quot;&amp;not;&quot;</span>, [<span class="dv">172</span>])<span class="fu">.....</span>]
+entitySet
+  <span class="fu">=</span> S.fromList
+      [<span class="st">&quot;&amp;intlarhk;&quot;</span>, <span class="st">&quot;&amp;male;&quot;</span>, <span class="st">&quot;&amp;not;&quot;</span>, <span class="st">&quot;&amp;clubs;&quot;</span>, <span class="st">&quot;&amp;cudarrl;&quot;</span><span class="fu">.....</span>]</code></pre>
+<p>Pretty nice, huh?</p>
+<h1 id="access-the-data">Access the data</h1>
+<p>Now we have the data and the only thing that’s left is to provide convinient functions to access that data. No comments here, it should be pretty clear:</p>
+<pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="kw">module</span> <span class="dt">Text.Html5.Entity</span>
+
+<span class="kw">import           </span><span class="dt">Control.Applicative</span> ((&lt;$&gt;))
+<span class="kw">import           </span><span class="dt">Data.Char</span> (chr)
+<span class="kw">import qualified</span> <span class="dt">Data.Map</span> <span class="kw">as</span> <span class="dt">M</span>
+<span class="kw">import qualified</span> <span class="dt">Data.Set</span> <span class="kw">as</span> <span class="dt">S</span>
+
+<span class="kw">import </span><span class="dt">Text.Html5.Entity.Data</span>
+
+<span class="ot">entityCodePoints ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">Maybe</span> [<span class="dt">Int</span>]
+entityCodePoints ent <span class="fu">=</span> M.lookup ent entityMap
+
+<span class="ot">entityChars ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">Maybe</span> <span class="dt">String</span>
+entityChars ent <span class="fu">=</span> map chr <span class="fu">&lt;$&gt;</span> M.lookup ent entityMap
+
+<span class="ot">isValidEntity ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">Bool</span>
+isValidEntity ent <span class="fu">=</span> S.member ent entitySet
+
+
+<span class="ot">nameToEntity ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">String</span>
+nameToEntity name <span class="fu">=</span> <span class="ch">'&amp;'</span> <span class="fu">:</span> name <span class="fu">++</span> <span class="st">&quot;;&quot;</span>
+
+<span class="ot">entityNameCodePoints ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">Maybe</span> [<span class="dt">Int</span>]
+entityNameCodePoints <span class="fu">=</span> entityCodePoints <span class="fu">.</span> nameToEntity
+
+<span class="ot">entityNameChars ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">Maybe</span> <span class="dt">String</span>
+entityNameChars <span class="fu">=</span> entityChars <span class="fu">.</span> nameToEntity
+
+<span class="ot">isValidEntityName ::</span> <span class="dt">String</span> <span class="ot">-&gt;</span> <span class="dt">Bool</span>
+isValidEntityName name <span class="fu">=</span> S.member (nameToEntity name) entitySet</code></pre>
+<h1 id="conclusion">Conclusion</h1>
+<p>The problem is solved. The actual library uses Text instead of strings and I was planning to add a reverse <code>characters -&gt; entity</code> mapping. I left out these details from the article to keep it simpler.</p>
+<p>The idea is not new, for example there is a tool <a href="https://www.gnu.org/software/gperf/">gperf</a> which generates C(++) code for hash-table lookup based on the lists of strings.</p>
+<p>However, I couldn’t find any applications of this method in Haskell, it certainly must be somewhere. I believe it is a pretty nice solution for some problems.</p>
+<p>It might worth to write a library which would simplify generation of such modules, on the other hand, how can it be simpler, in my case generating code took 20-30 lines of code.</p>
+<p>I’ve put the resultant library on Hackage under the name <a href="https://hackage.haskell.org/package/html5-entity">html5-entity</a>, the source is also available on <a href="https://github.com/zudov/html5-entity">github</a>.</p>
+
+        </div>
+    </body>
+<!-- Yandex.Metrika counter --><script type="text/javascript">(function (d, w, c) { (w[c] = w[c] || []).push(function() { try { w.yaCounter28591341 = new Ya.Metrika({id:28591341, accurateTrackBounce:true}); } catch(e) { } }); var n = d.getElementsByTagName("script")[0], s = d.createElement("script"), f = function () { n.parentNode.insertBefore(s, n); }; s.type = "text/javascript"; s.async = true; s.src = (d.location.protocol == "https:" ? "https:" : "http:") + "//mc.yandex.ru/metrika/watch.js"; if (w.opera == "[object Opera]") { d.addEventListener("DOMContentLoaded", f, false); } else { f(); } })(document, window, "yandex_metrika_callbacks");</script><noscript><div><img src="//mc.yandex.ru/watch/28591341" style="position:absolute; left:-9999px;" alt /></div></noscript><!-- /Yandex.Metrika counter -->
+</html>
