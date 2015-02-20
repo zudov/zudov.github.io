@@ -148,7 +148,7 @@
     <span class="hs-keyglyph">]</span>
 
 <span class="hs-definition">noloc</span> <span class="hs-keyglyph">=</span> <span class="hs-conid">SrcLoc</span> <span class="hs-str">""</span> <span class="hs-num">0</span> <span class="hs-num">0</span></code></pre>
-<p>Leaving alone a little verbosity it should be pretty clear. <code>SrcLoc</code> points to the location of the defenition in file, but when we generating the code it doesn’t matter.</p>
+<p>Leaving alone a little verbosity it should be pretty clear. <code>SrcLoc</code> points to the location of the defenition in file, but when we generate, it doesn’t matter.</p>
 <h3 id="assembling-it-together">Assembling it together</h3>
 <p>Seems like we are almost done with code-generating, what’s left is to parse our template, append it with our declarations and pretty-print it into our file. Let’s complete our <code>main</code> function.</p>
 <pre class="sourceCode haskell"><code class="sourceCode haskell"><span class="hs-definition">main</span> <span class="hs-keyglyph">=</span> <span class="hs-keyword">do</span>
