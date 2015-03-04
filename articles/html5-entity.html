@@ -33,7 +33,7 @@
 </ul>
 <p>While this article is not about parsing at all, I believe you see the problem: parser should consult with a big (2000+ fields) JSON object and in case if the parsed string is a valid entity string should be replaced with corresponding Unicode characters.</p>
 <h1 id="naive-solution">Naive solution</h1>
-<p>If I was using Javascript, I would be able to simply load that file and access it as a normal JS-object. However, I am using Haskell and our Glorious Compiler would refuse to compile JSON file.</p>
+<p>If I were using Javascript, I would be able to simply load that file and access it as a normal JS-object. However, I am using Haskell and our Glorious Compiler would refuse to compile JSON file.</p>
 <p>I could simply read the file at startup, parse it into appropriate data structure and pass to my entity parser. However, I don’t like that approach for several reasons:</p>
 <ul>
 <li>need to keep the file somewhere around</li>
